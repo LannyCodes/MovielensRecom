@@ -12,7 +12,7 @@ def main():
     print("="*80)
     
     # 初始化推荐系统
-    DATA_PATH = './data/ml-10M100K'
+    DATA_PATH = '/kaggle/input/ml-10m/ml-10M100K'
     recommender = MovieRecommender(DATA_PATH)
     
     # 准备数据
