@@ -147,9 +147,13 @@ class DataProcessor:
         return movie_features
     
     def prepare_training_data(self, ratings, user_stats, movie_features, 
-                             test_size=0.2, negative_samples=4):
+                             test_size=0.2, negative_samples=1):
         """准备训练数据（包括负采样）"""
         print("准备训练数据...")
+        
+        # ⚡ 内存优化：只使用部分数据
+        print("为节省内存，采样 50% 的评分数据...")
+        ratings = ratings.sample(frac=0.5, random_state=42).reset_index(drop=True)
         
         # 合并用户和电影特征
         data = ratings.merge(user_stats, on='user_id', how='left')
@@ -158,26 +162,27 @@ class DataProcessor:
         # 创建标签：评分>=4为正样本，<3为负样本
         data['label'] = (data['rating'] >= 4).astype(int)
         
-        # 负采样：为每个用户随机选择未评分的电影
-        print("进行负采样...")
+        # ⚡ 减少负采样比例：从 4 降到 1
+        print(f"进行负采样（每个正样本对应 {negative_samples} 个负样本）...")
         all_movie_ids = set(movie_features['movie_id'].values)
         
         negative_samples_list = []
         user_movie_pairs = data.groupby('user_id')['movie_id'].apply(set).to_dict()
         
-        for user_id, rated_movies in user_movie_pairs.items():
-            # 未评分的电影
+        # ⚡ 限制处理的用户数
+        sampled_users = list(user_movie_pairs.keys())[:50000]  # 最多处理 5 万用户
+        
+        for user_id in sampled_users:
+            rated_movies = user_movie_pairs[user_id]
             unrated_movies = list(all_movie_ids - rated_movies)
             
-            # 随机选择负样本
-            if len(unrated_movies) > negative_samples:
-                neg_samples = np.random.choice(
-                    unrated_movies, 
-                    size=min(negative_samples * len(rated_movies), len(unrated_movies)), 
-                    replace=False
-                )
+            # 每个用户最多采样固定数量的负样本
+            num_neg = min(negative_samples * len(rated_movies), 100)  # 每用户最多 100 个负样本
+            
+            if len(unrated_movies) > num_neg:
+                neg_samples = np.random.choice(unrated_movies, size=num_neg, replace=False)
             else:
-                neg_samples = unrated_movies
+                neg_samples = unrated_movies[:num_neg]
             
             for movie_id in neg_samples:
                 negative_samples_list.append({
@@ -186,18 +191,24 @@ class DataProcessor:
                     'label': 0
                 })
         
+        print(f"生成 {len(negative_samples_list)} 个负样本...")
+        
         # 合并正负样本
         neg_data = pd.DataFrame(negative_samples_list)
         neg_data = neg_data.merge(user_stats, on='user_id', how='left')
         neg_data = neg_data.merge(movie_features, on='movie_id', how='left')
         
+        # 清理内存
+        del negative_samples_list
+        
         # 只保留正样本的标签列
         data = pd.concat([data, neg_data], ignore_index=True)
+        del neg_data
         
         # 打乱数据
         data = data.sample(frac=1, random_state=42).reset_index(drop=True)
         
-        print(f"训练数据总量: {len(data)}")
+        print(f"训练数据总量: {len(data):,}")
         print(f"正样本: {data['label'].sum()}, 负样本: {len(data) - data['label'].sum()}")
         
         return data

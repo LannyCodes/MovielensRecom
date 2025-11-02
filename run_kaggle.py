@@ -37,8 +37,8 @@ def main():
         user_stats, 
         movie_features, 
         all_genres,
-        epochs=5,
-        batch_size=2048
+        epochs=3,        # ⚡ 减少到 3 轮
+        batch_size=4096  # ⚡ 增大 batch_size 减少内存占用
     )
     
     print(f"\n训练完成!")
