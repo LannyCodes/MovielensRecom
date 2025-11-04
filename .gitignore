@@ -30,7 +30,7 @@ env/
 .venv
 
 # PyTorch Models
-*.pth
+# track .pth (unignored)
 *.pt
 *.ckpt
 
@@ -41,7 +41,7 @@ saved_model/
 *.pb
 
 # Pickle files
-*.pkl
+# track .pkl (unignored)
 *.pickle
 
 # Jupyter Notebook

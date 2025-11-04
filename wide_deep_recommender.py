@@ -936,13 +936,111 @@ class MovieRecommender:
             pickle.dump(self.processor, f)
         
         print(f"处理器已保存至: {processor_path}")
-    
+
     def load(self, model_path='wide_deep_model.pth', processor_path='processor.pkl'):
         """加载模型和处理器"""
         with open(processor_path, 'rb') as f:
             self.processor = pickle.load(f)
         
+        # 构建占位模型，随后加载真实权重
         self.model = WideDeepModel(0, 0, 0)  # 参数会被加载的模型覆盖
         self.model.load_model(model_path)
         
         print("模型和处理器加载完成")
+    
+    def analyze_user_embedding(self, user_ids=None, top_dims=10):
+        """分析用户Embedding维度与用户统计/类型偏好的关系，打印简要报告。
+        参数:
+            user_ids: 可选，待分析的用户原始ID列表；默认随机抽样 5000 个已出现的用户
+            top_dims: 展示前多少个维度
+        """
+        if self.model is None or self.model.model is None:
+            print("模型未构建或未加载！")
+            return
+        # 取出已训练的用户embedding权重
+        user_emb_weight = self.model.model.user_embedding.weight.detach().cpu().numpy()
+        num_users, emb_dim = user_emb_weight.shape
+        top_dims = min(top_dims, emb_dim)
+
+        # 准备待分析的用户索引
+        if user_ids is None:
+            # 使用编码器中的类作为已知用户集合
+            all_user_raw = np.array(self.processor.user_encoder.classes_)
+            # 随机抽样最多5000个
+            rng = np.random.default_rng(42)
+            if len(all_user_raw) > 5000:
+                sampled_raw = rng.choice(all_user_raw, size=5000, replace=False)
+            else:
+                sampled_raw = all_user_raw
+        else:
+            sampled_raw = np.array(user_ids)
+
+        # 将原始ID映射为编码索引，过滤不可映射的ID
+        valid_mask = np.isin(sampled_raw, self.processor.user_encoder.classes_)
+        sampled_raw = sampled_raw[valid_mask]
+        sampled_idx = self.processor.user_encoder.transform(sampled_raw)
+
+        # 取用户统计特征
+        stats = self.processor.create_user_features(
+            # 仅使用这些用户的评分子集来避免全量内存压力
+            # 这里通过 data_path 重新读取评分
+            pd.read_csv(f"{self.data_path}/ratings.dat", sep='::', engine='python',
+                        names=['user_id', 'movie_id', 'rating', 'timestamp'], encoding='latin-1'),
+            pd.read_csv(f"{self.data_path}/movies.dat", sep='::', engine='python',
+                        names=['movie_id', 'title', 'genres'], encoding='latin-1')
+        )
+        stats = stats[stats['user_id'].isin(sampled_raw)].set_index('user_id')
+        # 用户类型偏好（每类占比）
+        # 构造每个用户的正样本(>=4)类型统计
+        ratings = pd.read_csv(f"{self.data_path}/ratings.dat", sep='::', engine='python',
+                              names=['user_id', 'movie_id', 'rating', 'timestamp'], encoding='latin-1')
+        movies = pd.read_csv(f"{self.data_path}/movies.dat", sep='::', engine='python',
+                             names=['movie_id', 'title', 'genres'], encoding='latin-1')
+        movies, all_genres = self.processor.process_genres(movies)
+        genre_cols = [f'genre_{g}' for g in all_genres]
+
+        # 仅保留抽样用户的高分交互
+        ratings_sub = ratings[ratings['user_id'].isin(sampled_raw)]
+        ratings_pos = ratings_sub[ratings_sub['rating'] >= 4]
+        user_genre_pref = ratings_pos.merge(movies[['movie_id'] + genre_cols], on='movie_id', how='left')
+        # 按用户计算各类型的平均出现率（作为偏好近似）
+        user_pref = user_genre_pref.groupby('user_id')[genre_cols].mean().fillna(0)
+
+        # 组装分析矩阵
+        emb_mat = user_emb_weight[sampled_idx, :top_dims]
+        # 对齐索引
+        common_users = np.intersect1d(user_pref.index.values, stats.index.values)
+        if len(common_users) == 0:
+            print("抽样用户过少或无交集，无法分析。")
+            return
+        emb_mat = emb_mat[np.isin(sampled_raw, common_users)]
+        stats = stats.loc[common_users]
+        user_pref = user_pref.loc[common_users]
+
+        # 计算每个维度与统计特征/类型偏好的皮尔逊相关
+        stat_cols = ['avg_rating', 'std_rating', 'rating_count', 'activity_days']
+        report_lines = []
+        for d in range(top_dims):
+            dim_vec = emb_mat[:, d]
+            # 与统计特征的相关
+            stat_corr = {c: np.corrcoef(dim_vec, stats[c].values)[0,1] if len(stats[c].values)>1 else np.nan for c in stat_cols}
+            # 与类型偏好的前三强相关
+            genre_corrs = {g: np.corrcoef(dim_vec, user_pref[g].values)[0,1] if len(user_pref[g].values)>1 else np.nan for g in genre_cols}
+            top_genres = sorted(genre_corrs.items(), key=lambda x: (np.nan_to_num(x[1], nan=0)), reverse=True)[:3]
+            report_lines.append((d, stat_corr, top_genres))
+
+        # 打印报告
+        print("\n用户Embedding维度分析 (前 %d 维):" % top_dims)
+        for d, stat_corr, top_genres in report_lines:
+            print(f"维度 {d}: ")
+            print("  与用户统计特征的相关:")
+            for k, v in stat_corr.items():
+                print(f"    - {k}: {v:.3f}")
+            print("  与类型偏好的Top-3相关:")
+            for g, v in top_genres:
+                print(f"    - {g.replace('genre_','')}: {v:.3f}")
+        print("\n提示: 相关系数越接近 ±1，说明该维与对应特征越相关。")
+
+    def quick_probe_user_embedding(self, user_ids=None, top_dims=10):
+        """便捷探针：一行调用完成Embedding维度报告"""
+        self.analyze_user_embedding(user_ids=user_ids, top_dims=top_dims)
