@@ -280,7 +280,8 @@ class WideDeepNet(nn.Module):
         
         self.deep_layers = nn.Sequential(*deep_layers_list)
         
-        # 初始化权重
+        # 初始化权重(手动初始化不是必须的，但在深度模型中是常见且推荐的做法，
+        # 能提升训练稳定性与收敛速度。你的项目保留当前实现是合理的。)
         self._init_weights()
     
     def _init_weights(self):
