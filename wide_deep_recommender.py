@@ -243,7 +243,7 @@ class WideDeepNet(nn.Module):
     """Wide & Deep 神经网络模型 (PyTorch)"""
     
     def __init__(self, num_users, num_movies, num_genres,
-                 embedding_dim=64, deep_layers=[512, 256, 128, 64]):
+                 embedding_dim=32, deep_layers=[256, 128, 64]):
         super(WideDeepNet, self).__init__()
         
         self.num_users = num_users
@@ -346,7 +346,7 @@ class WideDeepModel:
     """Wide & Deep 推荐模型 (PyTorch 版本)"""
     
     def __init__(self, num_users, num_movies, num_genres, 
-                 embedding_dim=64, deep_layers=[512, 256, 128, 64]):
+                 embedding_dim=32, deep_layers=[256, 128, 64]):
         self.num_users = num_users
         self.num_movies = num_movies
         self.num_genres = num_genres
@@ -762,13 +762,33 @@ class RerankEngine:
         user_stats_matrix = np.tile(user_stats_array, (num_samples, 1))
         
         # 电影统计特征和类型特征
-        movie_data = self.movie_features[
-            self.movie_features['movie_id'].isin(movie_ids)
-        ].set_index('movie_id').loc[movie_ids]
+        # 创建一个空列表来存储电影数据
+        movie_data_rows = []
         
-        movie_stats_matrix = movie_data[
-            ['avg_rating', 'std_rating', 'popularity']
-        ].fillna(0).values
+        # 为每个电影ID获取数据
+        for movie_id in movie_ids:
+            # 检查电影是否在movie_features中
+            movie_mask = self.movie_features['movie_id'] == movie_id
+            if movie_mask.any():
+                movie_data_rows.append(self.movie_features[movie_mask].iloc[0])
+            else:
+                # 如果电影不在movie_features中，创建默认行
+                default_data = {
+                    'avg_rating': 0.0,
+                    'std_rating': 0.0,
+                    'popularity': 0.0
+                }
+                # 添加类型特征列，默认为0
+                for genre in self.all_genres:
+                    default_data[f'genre_{genre}'] = 0.0
+                movie_data_rows.append(pd.Series(default_data))
+        
+        # 创建DataFrame
+        movie_data = pd.DataFrame(movie_data_rows)
+        
+        # 提取电影统计特征
+        movie_stats_columns = ['avg_rating', 'std_rating', 'popularity']
+        movie_stats_matrix = movie_data[movie_stats_columns].fillna(0).values
         
         # 类型特征
         genre_cols = [f'genre_{g}' for g in self.all_genres]
