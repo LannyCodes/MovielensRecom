@@ -11,7 +11,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import roc_auc_score, ndcg_score
+from sklearn.metrics import roc_auc_score
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
@@ -243,7 +243,7 @@ class WideDeepNet(nn.Module):
     """Wide & Deep 神经网络模型 (PyTorch)"""
     
     def __init__(self, num_users, num_movies, num_genres,
-                 embedding_dim=32, deep_layers=[256, 128, 64]):
+                 embedding_dim=64, deep_layers=[512, 256, 128, 64]):
         super(WideDeepNet, self).__init__()
         
         self.num_users = num_users
@@ -346,7 +346,7 @@ class WideDeepModel:
     """Wide & Deep 推荐模型 (PyTorch 版本)"""
     
     def __init__(self, num_users, num_movies, num_genres, 
-                 embedding_dim=32, deep_layers=[256, 128, 64]):
+                 embedding_dim=64, deep_layers=[512, 256, 128, 64]):
         self.num_users = num_users
         self.num_movies = num_movies
         self.num_genres = num_genres
@@ -420,8 +420,8 @@ class WideDeepModel:
         
         # 训练历史记录
         history = {
-            'loss': [], 'accuracy': [], 'auc': [], 'precision': [], 'recall': [], 'ndcg': [],
-            'val_loss': [], 'val_accuracy': [], 'val_auc': [], 'val_precision': [], 'val_recall': [], 'val_ndcg': []
+            'loss': [], 'accuracy': [], 'auc': [],
+            'val_loss': [], 'val_accuracy': [], 'val_auc': []
         }
         
         best_val_auc = 0.0
@@ -477,11 +477,6 @@ class WideDeepModel:
             train_acc = train_correct / train_total
             train_auc = roc_auc_score(train_labels, train_preds)
             
-            # 计算 Precision@10, Recall@10, NDCG@10
-            train_precision = precision_at_k(np.array(train_labels), np.array(train_preds), 10)
-            train_recall = recall_at_k(np.array(train_labels), np.array(train_preds), 10)
-            train_ndcg = ndcg_at_k(np.array(train_labels), np.array(train_preds), 10)
-            
             # ========== 验证阶段 ==========
             self.model.eval()
             val_loss = 0.0
@@ -518,28 +513,17 @@ class WideDeepModel:
             val_acc = val_correct / val_total
             val_auc = roc_auc_score(val_labels, val_preds)
             
-            # 计算 Precision@10, Recall@10, NDCG@10
-            val_precision = precision_at_k(np.array(val_labels), np.array(val_preds), 10)
-            val_recall = recall_at_k(np.array(val_labels), np.array(val_preds), 10)
-            val_ndcg = ndcg_at_k(np.array(val_labels), np.array(val_preds), 10)
-            
             # 记录历史
             history['loss'].append(train_loss)
             history['accuracy'].append(train_acc)
             history['auc'].append(train_auc)
-            history['precision'].append(train_precision)
-            history['recall'].append(train_recall)
-            history['ndcg'].append(train_ndcg)
             history['val_loss'].append(val_loss)
             history['val_accuracy'].append(val_acc)
             history['val_auc'].append(val_auc)
-            history['val_precision'].append(val_precision)
-            history['val_recall'].append(val_recall)
-            history['val_ndcg'].append(val_ndcg)
             
             # 打印结果
-            print(f"\n训练 - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, AUC: {train_auc:.4f}, Precision@10: {train_precision:.4f}, Recall@10: {train_recall:.4f}, NDCG@10: {train_ndcg:.4f}")
-            print(f"验证 - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}, Precision@10: {val_precision:.4f}, Recall@10: {val_recall:.4f}, NDCG@10: {val_ndcg:.4f}")
+            print(f"\n训练 - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, AUC: {train_auc:.4f}")
+            print(f"验证 - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
             
             # 学习率调度
             scheduler.step(val_auc)
@@ -1060,55 +1044,3 @@ class MovieRecommender:
     def quick_probe_user_embedding(self, user_ids=None, top_dims=10):
         """便捷探针：一行调用完成Embedding维度报告"""
         self.analyze_user_embedding(user_ids=user_ids, top_dims=top_dims)
-
-def precision_at_k(y_true, y_scores, k):
-    """计算 Precision@K"""
-    # 获取前 K 个预测
-    top_k_indices = np.argsort(y_scores)[::-1][:k]
-    top_k_true = y_true[top_k_indices]
-    
-    # 计算 Precision@K
-    precision = np.sum(top_k_true) / k
-    return precision
-
-def recall_at_k(y_true, y_scores, k):
-    """计算 Recall@K"""
-    # 获取前 K 个预测
-    top_k_indices = np.argsort(y_scores)[::-1][:k]
-    top_k_true = y_true[top_k_indices]
-    
-    # 计算召回的正样本数
-    relevant_items = np.sum(y_true)
-    
-    # 如果没有相关项目，返回 0
-    if relevant_items == 0:
-        return 0.0
-    
-    # 计算 Recall@K
-    recall = np.sum(top_k_true) / relevant_items
-    return recall
-
-def ndcg_at_k(y_true, y_scores, k):
-    """计算 NDCG@K"""
-    # 获取前 K 个预测
-    top_k_indices = np.argsort(y_scores)[::-1][:k]
-    top_k_true = y_true[top_k_indices]
-    
-    # 计算 DCG@K
-    dcg = 0.0
-    for i in range(min(k, len(top_k_true))):
-        dcg += (2 ** top_k_true[i] - 1) / np.log2(i + 2)
-    
-    # 计算 IDCG@K
-    sorted_true = np.sort(y_true)[::-1]
-    idcg = 0.0
-    for i in range(min(k, len(sorted_true))):
-        idcg += (2 ** sorted_true[i] - 1) / np.log2(i + 2)
-    
-    # 如果 IDCG 为 0，返回 0
-    if idcg == 0:
-        return 0.0
-    
-    # 计算 NDCG@K
-    ndcg = dcg / idcg
-    return ndcg
