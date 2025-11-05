@@ -761,38 +761,31 @@ class RerankEngine:
         ])
         user_stats_matrix = np.tile(user_stats_array, (num_samples, 1))
         
-        # 电影统计特征和类型特征
-        # 创建一个空列表来存储电影数据
-        movie_data_rows = []
-        
-        # 为每个电影ID获取数据
-        for movie_id in movie_ids:
-            # 检查电影是否在movie_features中
-            movie_mask = self.movie_features['movie_id'] == movie_id
-            if movie_mask.any():
-                movie_data_rows.append(self.movie_features[movie_mask].iloc[0])
-            else:
-                # 如果电影不在movie_features中，创建默认行
-                default_data = {
-                    'avg_rating': 0.0,
-                    'std_rating': 0.0,
-                    'popularity': 0.0
-                }
-                # 添加类型特征列，默认为0
-                for genre in self.all_genres:
-                    default_data[f'genre_{genre}'] = 0.0
-                movie_data_rows.append(pd.Series(default_data))
-        
-        # 创建DataFrame
-        movie_data = pd.DataFrame(movie_data_rows)
-        
-        # 提取电影统计特征
-        movie_stats_columns = ['avg_rating', 'std_rating', 'popularity']
-        movie_stats_matrix = movie_data[movie_stats_columns].fillna(0).values
-        
-        # 类型特征
+        # 电影统计特征和类型特征 - 修复顺序问题
+        movie_stats_list = []
+        genre_list = []
         genre_cols = [f'genre_{g}' for g in self.all_genres]
-        genre_matrix = movie_data[genre_cols].fillna(0).values
+        
+        for movie_id in movie_ids:
+            movie_row = self.movie_features[self.movie_features['movie_id'] == movie_id]
+            
+            if not movie_row.empty:
+                movie_row = movie_row.iloc[0]
+                # 电影统计特征
+                movie_stats_list.append([
+                    movie_row['avg_rating'],
+                    movie_row['std_rating'],
+                    movie_row['popularity']
+                ])
+                # 类型特征
+                genre_list.append([movie_row[col] for col in genre_cols])
+            else:
+                # 使用默认值
+                movie_stats_list.append([0.0, 0.0, 0.0])
+                genre_list.append([0.0] * len(self.all_genres))
+        
+        movie_stats_matrix = np.array(movie_stats_list)
+        genre_matrix = np.array(genre_list)
         
         return [
             user_ids.reshape(-1, 1),
@@ -809,8 +802,26 @@ class RerankEngine:
         # 准备特征
         X = self.prepare_features(user_id, candidate_movies)
         
+        # 添加调试信息
+        print(f"\n[调试] 特征形状:")
+        print(f"  用户ID: {X[0].shape}")
+        print(f"  电影ID: {X[1].shape}")
+        print(f"  用户统计: {X[2].shape}")
+        print(f"  电影统计: {X[3].shape}")
+        print(f"  类型特征: {X[4].shape}")
+        print(f"\n[调试] 前3个样本的电影统计特征:")
+        print(X[3][:3])
+        
         # 预测评分
         scores = self.model.predict(X).flatten()
+        
+        # 调试预测结果
+        print(f"\n[调试] 预测评分统计:")
+        print(f"  最小值: {scores.min():.4f}")
+        print(f"  最大值: {scores.max():.4f}")
+        print(f"  平均值: {scores.mean():.4f}")
+        print(f"  标准差: {scores.std():.4f}")
+        print(f"  前10个分数: {scores[:10]}")
         
         # 排序
         ranked_indices = np.argsort(scores)[::-1]
