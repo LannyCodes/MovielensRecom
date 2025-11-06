@@ -355,11 +355,14 @@ class WideDeepNet(nn.Module):
         batch_size = user_ids.size(0)
         
         # ========== Wide 部分：添加交叉特征 ==========
-        # 基础特征
-        user_ids_float = user_ids.float().unsqueeze(1)  # [batch_size, 1]
-        movie_ids_float = movie_ids.float().unsqueeze(1)  # [batch_size, 1]
+        # 基础特征（标准化 ID）
+        user_ids_norm = user_ids.float() / self.num_users  # 标准化到 [0, 1]
+        movie_ids_norm = movie_ids.float() / self.num_movies  # 标准化到 [0, 1]
         
-        # 交叉特征
+        user_ids_float = user_ids_norm.unsqueeze(1)  # [batch_size, 1]
+        movie_ids_float = movie_ids_norm.unsqueeze(1)  # [batch_size, 1]
+        
+        # 交叉特征（使用标准化后的 ID）
         user_movie_cross = (user_ids_float * movie_ids_float)  # user*movie ID 交叉
         user_avg_movie_avg_cross = (user_stats[:, 0:1] * movie_stats[:, 0:1])  # 平均评分交叉
         user_count_movie_pop_cross = (user_stats[:, 2:3] * movie_stats[:, 2:3])  # 评分数*流行度
@@ -1014,11 +1017,27 @@ class RerankEngine:
         # 步骤 2：准备特征
         X = self.prepare_features(user_id, candidate_movies)
         
+        # 调试：检查特征
+        print(f"\n[调试] 特征检查:")
+        print(f"  用户 ID 编码: {X[0][0][0]} (原始 ID: {user_id})")
+        print(f"  电影 ID 编码样例: {X[1][:3].flatten()}")
+        print(f"  用户统计特征: {X[2][0]}")
+        print(f"  电影统计特征样例: {X[3][0]}")
+        print(f"  类型特征样例: {X[4][0][:5]}")
+        
         # 步骤 3：预测评分
         scores = self.model.predict(X).flatten()
         
         print(f"\n[评分统计] 最小: {scores.min():.4f}, 最大: {scores.max():.4f}, "
               f"平均: {scores.mean():.4f}, 标准差: {scores.std():.4f}")
+        print(f"  前5个预测分数: {scores[:5]}")
+        
+        # 如果所有评分都是 0，说明模型有问题
+        if scores.max() == 0.0 and scores.min() == 0.0:
+            print("\n警告：所有预测评分都是 0！请检查：")
+            print("  1. 模型是否已经训练")
+            print("  2. 模型是否正确加载")
+            print("  3. 特征是否正确准备")
         
         # 步骤 4：排序
         ranked_indices = np.argsort(scores)[::-1]
