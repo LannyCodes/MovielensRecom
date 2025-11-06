@@ -863,7 +863,7 @@ class RerankEngine:
         self.movies = movies
         
     def prepare_features(self, user_id, movie_ids):
-        """准备特征用于模型预测"""
+        """准备特征用于模型预测（添加标准化）"""
         num_samples = len(movie_ids)
         
         # 用户ID编码
@@ -876,10 +876,10 @@ class RerankEngine:
         # 用户统计特征
         user_stat = self.user_stats[self.user_stats['user_id'] == user_id].iloc[0]
         user_stats_array = np.array([
-            user_stat['avg_rating'],
-            user_stat['std_rating'],
-            user_stat['rating_count'],
-            user_stat['activity_days']
+            user_stat['avg_rating'] / 5.0,  # 标准化到 [0, 1]
+            user_stat['std_rating'] / 2.0,  # 标准化
+            np.log1p(user_stat['rating_count']) / 10.0,  # log 变换并缩放
+            np.log1p(user_stat['activity_days']) / 10.0  # log 变换并缩放
         ])
         user_stats_matrix = np.tile(user_stats_array, (num_samples, 1))
         
@@ -893,11 +893,11 @@ class RerankEngine:
             
             if not movie_row.empty:
                 movie_row = movie_row.iloc[0]
-                # 电影统计特征
+                # 电影统计特征（标准化）
                 movie_stats_list.append([
-                    movie_row['avg_rating'],
-                    movie_row['std_rating'],
-                    movie_row['popularity']
+                    movie_row['avg_rating'] / 5.0,  # 标准化到 [0, 1]
+                    movie_row['std_rating'] / 2.0,  # 标准化
+                    movie_row['popularity'] / 10.0  # 缩放
                 ])
                 # 类型特征
                 genre_list.append([movie_row[col] for col in genre_cols])
@@ -1078,7 +1078,7 @@ class MovieRecommender:
     
     def build_and_train(self, train_data, user_stats, movie_features, all_genres,
                        epochs=10, batch_size=1024):
-        """构建和训练模型"""
+        """构建和训练模型（添加特征标准化）"""
         # 编码用户和电影ID
         self.processor.user_encoder.fit(train_data['user_id'])
         self.processor.movie_encoder.fit(train_data['movie_id'])
@@ -1088,14 +1088,30 @@ class MovieRecommender:
         
         X_user = self.processor.user_encoder.transform(train_data['user_id'])
         X_movie = self.processor.movie_encoder.transform(train_data['movie_id'])
+        
+        # 用户统计特征（标准化）
         X_user_stats = train_data[
             ['avg_rating_x', 'std_rating_x', 'rating_count_x', 'activity_days']
         ].fillna(0).values
+        X_user_stats[:, 0] = X_user_stats[:, 0] / 5.0  # avg_rating
+        X_user_stats[:, 1] = X_user_stats[:, 1] / 2.0  # std_rating
+        X_user_stats[:, 2] = np.log1p(X_user_stats[:, 2]) / 10.0  # rating_count
+        X_user_stats[:, 3] = np.log1p(X_user_stats[:, 3]) / 10.0  # activity_days
+        
+        # 电影统计特征（标准化）
         X_movie_stats = train_data[
             ['avg_rating_y', 'std_rating_y', 'popularity']
         ].fillna(0).values
+        X_movie_stats[:, 0] = X_movie_stats[:, 0] / 5.0  # avg_rating
+        X_movie_stats[:, 1] = X_movie_stats[:, 1] / 2.0  # std_rating
+        X_movie_stats[:, 2] = X_movie_stats[:, 2] / 10.0  # popularity
+        
         X_genres = train_data[genre_cols].fillna(0).values
         y = train_data['label'].values
+        
+        print(f"\n[特征统计]")
+        print(f"  用户统计特征范围: {X_user_stats.min():.4f} ~ {X_user_stats.max():.4f}")
+        print(f"  电影统计特征范围: {X_movie_stats.min():.4f} ~ {X_movie_stats.max():.4f}")
         
         # 划分训练集和验证集
         indices = np.arange(len(train_data))
