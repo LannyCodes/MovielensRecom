@@ -11,7 +11,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, ndcg_score
+from collections import defaultdict
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
@@ -100,7 +101,7 @@ class DataProcessor:
         return movies, all_genres
     
     def create_user_features(self, ratings, movies):
-        """创建用户特征"""
+        """创建用户特征（包含 TF-IDF 类型偏好）"""
         print("创建用户特征...")
         
         # 用户统计特征
@@ -120,7 +121,52 @@ class DataProcessor:
             user_stats['last_rating_time'] - user_stats['first_rating_time']
         ) / (24 * 3600)
         
+        # 计算用户类型偏好的 TF-IDF
+        print("计算 TF-IDF 类型偏好...")
+        user_genre_tfidf = self._compute_user_genre_tfidf(ratings, movies)
+        user_stats = user_stats.merge(user_genre_tfidf, on='user_id', how='left')
+        
         return user_stats
+    
+    def _compute_user_genre_tfidf(self, ratings, movies):
+        """计算用户类型偏好的 TF-IDF 权重"""
+        # 合并评分和电影类型
+        user_movies = ratings.merge(movies[['movie_id', 'genres']], on='movie_id')
+        
+        # 只考虑高评分（>=4）的电影
+        user_movies = user_movies[user_movies['rating'] >= 4]
+        
+        # 计算 TF：用户对每个类型的评分频率
+        user_genre_tf = defaultdict(lambda: defaultdict(int))
+        for _, row in user_movies.iterrows():
+            user_id = row['user_id']
+            for genre in row['genres'].split('|'):
+                user_genre_tf[user_id][genre] += 1
+        
+        # 计算 IDF：类型的稀有程度
+        total_users = ratings['user_id'].nunique()
+        genre_user_count = defaultdict(int)
+        for user_genres in user_genre_tf.values():
+            for genre in user_genres.keys():
+                genre_user_count[genre] += 1
+        
+        genre_idf = {}
+        for genre, count in genre_user_count.items():
+            genre_idf[genre] = np.log(total_users / (count + 1))
+        
+        # 计算 TF-IDF 并构造特征
+        user_tfidf_features = []
+        for user_id in ratings['user_id'].unique():
+            user_tf = user_genre_tf.get(user_id, {})
+            tfidf_dict = {'user_id': user_id}
+            
+            for genre, tf in user_tf.items():
+                idf = genre_idf.get(genre, 0)
+                tfidf_dict[f'tfidf_{genre}'] = tf * idf
+            
+            user_tfidf_features.append(tfidf_dict)
+        
+        return pd.DataFrame(user_tfidf_features).fillna(0)
     
     def create_movie_features(self, ratings, movies):
         """创建电影特征"""
@@ -240,10 +286,10 @@ class MovieDataset(Dataset):
 
 
 class WideDeepNet(nn.Module):
-    """Wide & Deep 神经网络模型 (PyTorch)"""
+    """Wide & Deep 神经网络模型 (PyTorch) - 增强版"""
     
     def __init__(self, num_users, num_movies, num_genres,
-                 embedding_dim=32, deep_layers=[256, 128, 64]):
+                 embedding_dim=64, deep_layers=[512, 256, 128]):
         super(WideDeepNet, self).__init__()
         
         self.num_users = num_users
@@ -251,20 +297,21 @@ class WideDeepNet(nn.Module):
         self.num_genres = num_genres
         self.embedding_dim = embedding_dim
         
-        # ========== Wide 部分 ==========
+        # ========== Wide 部分：增强交叉特征 ==========
         # Wide 输入维度: 2(user+movie) + 4(user_stats) + 3(movie_stats) + num_genres
-        wide_input_dim = 2 + 4 + 3 + num_genres
+        # + 交叉特征: user*movie, user_avg*movie_avg, user_count*movie_popularity
+        wide_input_dim = 2 + 4 + 3 + num_genres + 3  # 增加 3 个交叉特征
         self.wide_layer = nn.Linear(wide_input_dim, 1)
         
-        # ========== Deep 部分 ==========
-        # Embedding 层
+        # ========== Deep 部分：增大 Embedding 维度 ==========
+        # Embedding 层：32 -> 64 维
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.movie_embedding = nn.Embedding(num_movies, embedding_dim)
         
         # Deep 输入维度: 2*embedding_dim + 4(user_stats) + 3(movie_stats) + num_genres
         deep_input_dim = 2 * embedding_dim + 4 + 3 + num_genres
         
-        # 构建深度网络层
+        # 构建深度网络层：[256,128,64] -> [512,256,128]
         deep_layers_list = []
         prev_dim = deep_input_dim
         
@@ -301,20 +348,32 @@ class WideDeepNet(nn.Module):
         参数:
             user_ids: [batch_size]
             movie_ids: [batch_size]
-            user_stats: [batch_size, 4]
-            movie_stats: [batch_size, 3]
+            user_stats: [batch_size, 4] - [avg_rating, std_rating, rating_count, activity_days]
+            movie_stats: [batch_size, 3] - [avg_rating, std_rating, popularity]
             genres: [batch_size, num_genres]
         """
         batch_size = user_ids.size(0)
         
-        # ========== Wide 部分 ==========
+        # ========== Wide 部分：添加交叉特征 ==========
+        # 基础特征
+        user_ids_float = user_ids.float().unsqueeze(1)  # [batch_size, 1]
+        movie_ids_float = movie_ids.float().unsqueeze(1)  # [batch_size, 1]
+        
+        # 交叉特征
+        user_movie_cross = (user_ids_float * movie_ids_float)  # user*movie ID 交叉
+        user_avg_movie_avg_cross = (user_stats[:, 0:1] * movie_stats[:, 0:1])  # 平均评分交叉
+        user_count_movie_pop_cross = (user_stats[:, 2:3] * movie_stats[:, 2:3])  # 评分数*流行度
+        
         # 拼接所有特征作为 Wide 输入
         wide_input = torch.cat([
-            user_ids.float().unsqueeze(1),  # [batch_size, 1]
-            movie_ids.float().unsqueeze(1),  # [batch_size, 1]
+            user_ids_float,
+            movie_ids_float,
             user_stats,  # [batch_size, 4]
             movie_stats,  # [batch_size, 3]
-            genres  # [batch_size, num_genres]
+            genres,  # [batch_size, num_genres]
+            user_movie_cross,  # [batch_size, 1]
+            user_avg_movie_avg_cross,  # [batch_size, 1]
+            user_count_movie_pop_cross  # [batch_size, 1]
         ], dim=1)
         
         wide_output = self.wide_layer(wide_input)  # [batch_size, 1]
@@ -343,10 +402,10 @@ class WideDeepNet(nn.Module):
 
 
 class WideDeepModel:
-    """Wide & Deep 推荐模型 (PyTorch 版本)"""
+    """Wide & Deep 推荐模型 (PyTorch 版本) - 增强版"""
     
     def __init__(self, num_users, num_movies, num_genres, 
-                 embedding_dim=32, deep_layers=[256, 128, 64]):
+                 embedding_dim=64, deep_layers=[512, 256, 128]):
         self.num_users = num_users
         self.num_movies = num_movies
         self.num_genres = num_genres
@@ -704,41 +763,104 @@ class RecallEngine:
         
         return candidate_movies.index.tolist()
     
+    def diversity_recall(self, user_id, top_k=50):
+        """多样性召回：推荐不同类型的电影"""
+        user_ratings = self.ratings[self.ratings['user_id'] == user_id]
+        
+        if len(user_ratings) == 0:
+            # 冷启动：返回各个类型的热门电影
+            all_genres = ['Action', 'Adventure', 'Animation', 'Children', 'Comedy',
+                         'Crime', 'Documentary', 'Drama', 'Fantasy', 'Film-Noir',
+                         'Horror', 'Musical', 'Mystery', 'Romance', 'Sci-Fi',
+                         'Thriller', 'War', 'Western']
+            diverse_movies = []
+            for genre in all_genres[:10]:  # 取前10个类型
+                genre_movies = self.movies[
+                    self.movies['genres'].str.contains(genre)
+                ].merge(self.movie_features[['movie_id', 'popularity']], on='movie_id')
+                if len(genre_movies) > 0:
+                    top_movie = genre_movies.nlargest(1, 'popularity')['movie_id'].values
+                    if len(top_movie) > 0:
+                        diverse_movies.append(top_movie[0])
+            return diverse_movies[:top_k]
+        
+        # 获取用户已评分的类型
+        user_movies = user_ratings.merge(self.movies, on='movie_id')
+        user_genres = set()
+        for genres_str in user_movies['genres']:
+            user_genres.update(genres_str.split('|'))
+        
+        # 找到用户未接触过的类型
+        all_genres = set()
+        for genres_str in self.movies['genres']:
+            all_genres.update(genres_str.split('|'))
+        
+        unexplored_genres = all_genres - user_genres
+        
+        # 从未探索类型中推荐热门电影
+        diverse_movies = []
+        rated_movie_ids = set(user_ratings['movie_id'].values)
+        
+        for genre in list(unexplored_genres)[:5]:  # 取前5个未探索类型
+            genre_movies = self.movies[
+                self.movies['genres'].str.contains(genre)
+            ].merge(self.movie_features[['movie_id', 'popularity']], on='movie_id')
+            
+            genre_movies = genre_movies[
+                ~genre_movies['movie_id'].isin(rated_movie_ids)
+            ]
+            
+            if len(genre_movies) > 0:
+                top_movies = genre_movies.nlargest(10, 'popularity')['movie_id'].tolist()
+                diverse_movies.extend(top_movies)
+        
+        return diverse_movies[:top_k]
+    
     def multi_recall(self, user_id, top_k=200):
-        """多路召回：整合多种召回策略"""
+        """多路召回：整合多种召回策略（增强版）"""
         recalled_movies = set()
         
         # 热门召回
         popular = self.popular_recall(top_k=50)
         recalled_movies.update(popular)
+        print(f"  - 热门召回: {len(popular)} 部")
         
         # 类型召回
-        genre_based = self.genre_based_recall(user_id, top_k=100)
+        genre_based = self.genre_based_recall(user_id, top_k=80)
         recalled_movies.update(genre_based)
+        print(f"  - 类型召回: {len(genre_based)} 部")
         
         # 协同过滤召回
-        collaborative = self.collaborative_recall(user_id, top_k=100)
+        collaborative = self.collaborative_recall(user_id, top_k=80)
         recalled_movies.update(collaborative)
+        print(f"  - 协同过滤召回: {len(collaborative)} 部")
+        
+        # 多样性召回（新增）
+        diversity = self.diversity_recall(user_id, top_k=50)
+        recalled_movies.update(diversity)
+        print(f"  - 多样性召回: {len(diversity)} 部")
         
         # 限制总数
         recalled_movies = list(recalled_movies)[:top_k]
         
-        print(f"召回候选电影数: {len(recalled_movies)}")
+        print(f"总召回候选电影数: {len(recalled_movies)}")
         
         return recalled_movies
 
 
 class RerankEngine:
-    """重排序引擎：使用 Wide & Deep 模型进行精排"""
+    """重排序引擎：使用 Wide & Deep 模型进行精排（增强版）"""
     
     def __init__(self, model, user_encoder, movie_encoder, 
-                 user_stats, movie_features, all_genres):
+                 user_stats, movie_features, all_genres, ratings, movies):
         self.model = model
         self.user_encoder = user_encoder
         self.movie_encoder = movie_encoder
         self.user_stats = user_stats
         self.movie_features = movie_features
         self.all_genres = all_genres
+        self.ratings = ratings
+        self.movies = movies
         
     def prepare_features(self, user_id, movie_ids):
         """准备特征用于模型预测"""
@@ -795,38 +917,132 @@ class RerankEngine:
             genre_matrix
         ]
     
-    def rerank(self, user_id, candidate_movies, top_k=10):
-        """对候选电影进行重排序"""
+    def apply_diversity_control(self, candidate_movies, scores, lambda_param=0.5):
+        """应用 MMR 多样性控制"""
+        # 获取电影类型信息
+        movie_genres = {}
+        for movie_id in candidate_movies:
+            movie_row = self.movies[self.movies['movie_id'] == movie_id]
+            if not movie_row.empty:
+                movie_genres[movie_id] = set(movie_row.iloc[0]['genres'].split('|'))
+            else:
+                movie_genres[movie_id] = set()
+        
+        # MMR 算法
+        selected = []
+        selected_genres = set()
+        remaining = list(zip(candidate_movies, scores))
+        
+        # 选择第一部电影（分数最高）
+        if remaining:
+            best_movie, best_score = max(remaining, key=lambda x: x[1])
+            selected.append((best_movie, best_score))
+            selected_genres.update(movie_genres.get(best_movie, set()))
+            remaining.remove((best_movie, best_score))
+        
+        # 迭代选择剩余电影
+        while remaining and len(selected) < len(candidate_movies):
+            best_mmr_score = -float('inf')
+            best_item = None
+            
+            for movie_id, score in remaining:
+                # 计算与已选电影的类型重叠度
+                genres = movie_genres.get(movie_id, set())
+                overlap = len(genres & selected_genres)
+                diversity_penalty = overlap / (len(genres) + 1e-6)
+                
+                # MMR 分数：平衡相关性和多样性
+                mmr_score = lambda_param * score - (1 - lambda_param) * diversity_penalty
+                
+                if mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_item = (movie_id, score)
+            
+            if best_item:
+                selected.append(best_item)
+                selected_genres.update(movie_genres.get(best_item[0], set()))
+                remaining.remove(best_item)
+            else:
+                break
+        
+        return zip(*selected) if selected else ([], [])
+    
+    def remove_user_history(self, user_id, candidate_movies):
+        """移除用户历史评分过的电影"""
+        user_ratings = self.ratings[self.ratings['user_id'] == user_id]
+        rated_movie_ids = set(user_ratings['movie_id'].values)
+        
+        filtered_movies = [m for m in candidate_movies if m not in rated_movie_ids]
+        print(f"  - 移除历史: {len(candidate_movies)} -> {len(filtered_movies)}")
+        return filtered_movies
+    
+    def balance_genre_distribution(self, candidate_movies, scores, max_per_genre=3):
+        """平衡类型分布，避免某个类型占比过高"""
+        genre_count = defaultdict(int)
+        balanced_movies = []
+        balanced_scores = []
+        
+        for movie_id, score in zip(candidate_movies, scores):
+            movie_row = self.movies[self.movies['movie_id'] == movie_id]
+            if movie_row.empty:
+                balanced_movies.append(movie_id)
+                balanced_scores.append(score)
+                continue
+            
+            genres = movie_row.iloc[0]['genres'].split('|')
+            primary_genre = genres[0]  # 使用第一个类型作为主类型
+            
+            if genre_count[primary_genre] < max_per_genre:
+                balanced_movies.append(movie_id)
+                balanced_scores.append(score)
+                genre_count[primary_genre] += 1
+        
+        return balanced_movies, balanced_scores
+    
+    def rerank(self, user_id, candidate_movies, top_k=10, 
+               enable_diversity=True, enable_dedup=True, enable_balance=False):
+        """对候选电影进行重排序（增强版）"""
         print(f"重排序 {len(candidate_movies)} 部候选电影...")
         
-        # 准备特征
+        # 步骤 1：移除用户历史
+        if enable_dedup:
+            candidate_movies = self.remove_user_history(user_id, candidate_movies)
+            if len(candidate_movies) == 0:
+                print("所有候选电影都已被评分")
+                return [], []
+        
+        # 步骤 2：准备特征
         X = self.prepare_features(user_id, candidate_movies)
         
-        # 添加调试信息
-        print(f"\n[调试] 特征形状:")
-        print(f"  用户ID: {X[0].shape}")
-        print(f"  电影ID: {X[1].shape}")
-        print(f"  用户统计: {X[2].shape}")
-        print(f"  电影统计: {X[3].shape}")
-        print(f"  类型特征: {X[4].shape}")
-        print(f"\n[调试] 前3个样本的电影统计特征:")
-        print(X[3][:3])
-        
-        # 预测评分
+        # 步骤 3：预测评分
         scores = self.model.predict(X).flatten()
         
-        # 调试预测结果
-        print(f"\n[调试] 预测评分统计:")
-        print(f"  最小值: {scores.min():.4f}")
-        print(f"  最大值: {scores.max():.4f}")
-        print(f"  平均值: {scores.mean():.4f}")
-        print(f"  标准差: {scores.std():.4f}")
-        print(f"  前10个分数: {scores[:10]}")
+        print(f"\n[评分统计] 最小: {scores.min():.4f}, 最大: {scores.max():.4f}, "
+              f"平均: {scores.mean():.4f}, 标准差: {scores.std():.4f}")
         
-        # 排序
+        # 步骤 4：排序
         ranked_indices = np.argsort(scores)[::-1]
-        ranked_movies = [candidate_movies[i] for i in ranked_indices[:top_k]]
-        ranked_scores = [scores[i] for i in ranked_indices[:top_k]]
+        ranked_movies = [candidate_movies[i] for i in ranked_indices]
+        ranked_scores = scores[ranked_indices]
+        
+        # 步骤 5：应用多样性控制
+        if enable_diversity and len(ranked_movies) > top_k:
+            print("  - 应用 MMR 多样性控制...")
+            ranked_movies, ranked_scores = self.apply_diversity_control(
+                ranked_movies[:top_k*3], ranked_scores[:top_k*3]
+            )
+            ranked_movies = list(ranked_movies)[:top_k]
+            ranked_scores = list(ranked_scores)[:top_k]
+        else:
+            ranked_movies = ranked_movies[:top_k]
+            ranked_scores = ranked_scores[:top_k].tolist()
+        
+        # 步骤 6：平衡类型分布（可选）
+        if enable_balance:
+            print("  - 平衡类型分布...")
+            ranked_movies, ranked_scores = self.balance_genre_distribution(
+                ranked_movies, ranked_scores
+            )
         
         return ranked_movies, ranked_scores
 
@@ -926,14 +1142,16 @@ class MovieRecommender:
         # 召回引擎
         self.recall_engine = RecallEngine(ratings, movies, movie_features)
         
-        # 重排序引擎
+        # 重排序引擎（增强版）
         self.rerank_engine = RerankEngine(
             self.model,
             self.processor.user_encoder,
             self.processor.movie_encoder,
             user_stats,
             movie_features,
-            all_genres
+            all_genres,
+            ratings,  # 新增
+            movies    # 新增
         )
     
     def recommend(self, user_id, top_k=10):
@@ -1075,3 +1293,90 @@ class MovieRecommender:
     def quick_probe_user_embedding(self, user_ids=None, top_dims=10):
         """便捷探针：一行调用完成Embedding维度报告"""
         self.analyze_user_embedding(user_ids=user_ids, top_dims=top_dims)
+    
+    def evaluate_ranking_metrics(self, test_ratings, k_list=[5, 10, 20]):
+        """
+        评估 Ranking 指标：Precision@K, Recall@K, NDCG@K
+        
+        参数:
+            test_ratings: 测试集 DataFrame，包含 user_id, movie_id, rating 列
+            k_list: 要评估的 K 值列表
+        
+        返回:
+            各指标的平均值字典
+        """
+        print("\n" + "="*80)
+        print("评估 Ranking 指标 (Precision@K, Recall@K, NDCG@K)")
+        print("="*80)
+        
+        # 筛选正样本（评分 >= 4）
+        test_positives = test_ratings[test_ratings['rating'] >= 4]
+        
+        # 按用户分组
+        user_groups = test_positives.groupby('user_id')['movie_id'].apply(set).to_dict()
+        
+        metrics = {f'Precision@{k}': [] for k in k_list}
+        metrics.update({f'Recall@{k}': [] for k in k_list})
+        metrics.update({f'NDCG@{k}': [] for k in k_list})
+        
+        test_users = list(user_groups.keys())[:100]  # 测试前100个用户
+        print(f"在 {len(test_users)} 个测试用户上评估...\n")
+        
+        for idx, user_id in enumerate(test_users):
+            if (idx + 1) % 20 == 0:
+                print(f"  已处理 {idx+1}/{len(test_users)} 用户...")
+            
+            try:
+                # 生成推荐
+                max_k = max(k_list)
+                recommended_movies, scores = self.recommend(user_id, top_k=max_k)
+                
+                if len(recommended_movies) == 0:
+                    continue
+                
+                # 获取用户的正样本
+                true_items = user_groups.get(user_id, set())
+                
+                if len(true_items) == 0:
+                    continue
+                
+                # 计算各种 K 值的指标
+                for k in k_list:
+                    pred_k = set(recommended_movies[:k])
+                    hits = len(pred_k & true_items)
+                    
+                    # Precision@K
+                    precision = hits / k if k > 0 else 0
+                    metrics[f'Precision@{k}'].append(precision)
+                    
+                    # Recall@K
+                    recall = hits / len(true_items) if len(true_items) > 0 else 0
+                    metrics[f'Recall@{k}'].append(recall)
+                    
+                    # NDCG@K
+                    dcg = sum([1 / np.log2(i + 2) if recommended_movies[i] in true_items else 0 
+                              for i in range(min(k, len(recommended_movies)))])
+                    idcg = sum([1 / np.log2(i + 2) for i in range(min(k, len(true_items)))])
+                    ndcg = dcg / idcg if idcg > 0 else 0
+                    metrics[f'NDCG@{k}'].append(ndcg)
+                    
+            except Exception as e:
+                print(f"  用户 {user_id} 评估失败: {e}")
+                continue
+        
+        # 计算平均值
+        results = {}
+        print("\n" + "="*80)
+        print("评估结果:")
+        print("="*80)
+        for metric_name, values in metrics.items():
+            if len(values) > 0:
+                avg_value = np.mean(values)
+                results[metric_name] = avg_value
+                print(f"{metric_name:20s}: {avg_value:.4f}")
+            else:
+                results[metric_name] = 0.0
+                print(f"{metric_name:20s}: N/A")
+        
+        print("="*80)
+        return results
